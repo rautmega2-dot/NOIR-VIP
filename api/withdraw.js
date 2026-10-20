@@ -2,16 +2,17 @@ import crypto, { randomUUID } from "node:crypto";
 import { getAuthenticatedUser, db } from "./_auth.js";
 
 const round = (n) => Math.round(n * 1e6) / 1e6;
+const round2 = (n) => Math.round(n * 100) / 100;
 
-function detectNetwork(address) {
-  if (/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(address)) return "TRC20";
-  if (/^0x[a-fA-F0-9]{40}$/.test(address)) return "BEP20";
-  return null;
-}
+// User ke chip ka naam -> OxaPay ko jaane wala network naam
+const NETWORKS = { BEP20: "BEP20", ERC20: "ERC20", POLYGON: "Polygon" };
 
-function addressKey(address, network) {
-  const normalized = network === "BEP20" ? address.toLowerCase() : address;
-  return crypto.createHash("sha256").update(normalized).digest("hex");
+// BEP20, ERC20 aur Polygon, teeno ke address 0x se shuru hote hain
+const isEvmAddress = (address) => /^0x[a-fA-F0-9]{40}$/.test(address);
+
+// Ek hi address ka key sabhi networks par same rahega
+function addressKey(address) {
+  return crypto.createHash("sha256").update(address.toLowerCase()).digest("hex");
 }
 
 // Ek user ki do withdrawal requests ek saath na chalein (double tap / parallel request)
@@ -57,7 +58,7 @@ export default async function handler(req, res) {
 
     const settings = settingsSnap.exists()
       ? settingsSnap.val()
-      : { withdrawalEnabled: true, minWithdrawal: 1, maxWithdrawal: 100000 };
+      : { withdrawalEnabled: true, minWithdrawal: 1, maxWithdrawal: 100000, withdrawalChargePercent: 0 };
 
     // Withdrawal ON/OFF
     if (settings.withdrawalEnabled !== true) {
@@ -76,6 +77,9 @@ export default async function handler(req, res) {
       return res.status(500).json({ success: false, message: "Withdrawal settings are invalid" });
     }
 
+    // Admin-controlled withdrawal charge (%), ek hi sab networks ke liye
+    const chargePercent = Math.min(99.99, Math.max(0, Number(settings.withdrawalChargePercent) || 0));
+
     const sandbox = process.env.OXAPAY_SANDBOX === "true";
     const payoutKey = process.env.OXAPAY_PAYOUT_API_KEY;
     const baseUrl = process.env.SITE_URL || "https://noir-vip.vercel.app";
@@ -91,7 +95,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ success: false, message: "Invalid withdrawal amount" });
     }
 
-    const amount = Math.round(requested * 100) / 100;
+    const amount = round2(requested);
 
     // Admin-controlled minimum / maximum
     if (amount < minWithdrawal || amount > maxWithdrawal) {
@@ -99,6 +103,14 @@ export default async function handler(req, res) {
         success: false,
         message: `Withdrawal amount must be between ${minWithdrawal} and ${maxWithdrawal} USDT`,
       });
+    }
+
+    // Charge: balance se poori amount kategi, user ko amount minus charge milega
+    const fee = round2((amount * chargePercent) / 100);
+    const netAmount = round2(amount - fee);
+
+    if (netAmount <= 0) {
+      return res.status(400).json({ success: false, message: "Amount is too low after the withdrawal charge" });
     }
 
     // Admin option: withdrawal se pehle kam se kam 1 project kharidna zaroori
@@ -113,10 +125,16 @@ export default async function handler(req, res) {
       }
     }
 
-    const network = detectNetwork(address);
+    // Network: user chip se chunta hai (BEP20 / ERC20 / POLYGON). Na bheje to BEP20.
+    const wantedNetwork = String((req.body && req.body.network) || "BEP20").trim().toUpperCase();
+    const network = NETWORKS[wantedNetwork];
 
     if (!network) {
-      return res.status(400).json({ success: false, message: "Enter a valid USDT address (TRC20 or BEP20)" });
+      return res.status(400).json({ success: false, message: "Choose a valid network (BEP20, ERC20 or Polygon)" });
+    }
+
+    if (!isEvmAddress(address)) {
+      return res.status(400).json({ success: false, message: "Enter a valid wallet address starting with 0x" });
     }
 
     // Balance pehle dekho, taaki bina paise wala user kisi ka address "lock" na kar sake
@@ -126,7 +144,7 @@ export default async function handler(req, res) {
     }
 
     // 1. One address can belong to only one account.
-    const lockRef = database.ref("addressLocks/" + addressKey(address, network));
+    const lockRef = database.ref("addressLocks/" + addressKey(address));
 
     const lock = await lockRef.transaction((current) => {
       if (current === null) {
@@ -142,7 +160,7 @@ export default async function handler(req, res) {
       return res.status(409).json({ success: false, message: "This address is already linked to another account" });
     }
 
-    // 2. Save withdrawal request
+    // 2. Save withdrawal request (amount = poori rakam jo balance se kati)
     const withdrawalId = "WDR_" + randomUUID();
     const requestRef = database.ref("withdrawalRequests/" + withdrawalId);
 
@@ -150,6 +168,9 @@ export default async function handler(req, res) {
       withdrawalId,
       uid: auth.uid,
       amount,
+      chargePercent,
+      fee,
+      netAmount,
       currency: "USDT",
       address,
       network,
@@ -158,7 +179,7 @@ export default async function handler(req, res) {
       createdAt: Date.now(),
     });
 
-    // 3. Deduct balance atomically
+    // 3. Deduct balance atomically (poori amount)
     const walletRef = database.ref("wallets/" + auth.uid);
 
     const debit = await walletRef.transaction((current) => {
@@ -192,6 +213,8 @@ export default async function handler(req, res) {
         success: true,
         withdrawalId,
         amount,
+        fee,
+        netAmount,
         currency: "USDT",
         status: "sandbox_simulated",
       });
@@ -199,7 +222,7 @@ export default async function handler(req, res) {
 
     await requestRef.update({ status: "processing", updatedAt: Date.now() });
 
-    // 4b. Live OxaPay payout
+    // 4b. Live OxaPay payout (user ko amount minus charge bheja jaata hai)
     let response;
     let result;
 
@@ -210,7 +233,7 @@ export default async function handler(req, res) {
         body: JSON.stringify({
           address,
           currency: "USDT",
-          amount,
+          amount: netAmount,
           network,
           description: withdrawalId,
           callback_url: baseUrl + "/api/oxapay-webhook",
@@ -226,7 +249,7 @@ export default async function handler(req, res) {
       return res.status(202).json({ success: true, withdrawalId, status: "review_required" });
     }
 
-    // Clear payout failure -> refund once
+    // Clear payout failure -> refund once (poori amount wapas)
     if (!response.ok || !result.data || !result.data.track_id) {
       console.error(
         "OxaPay payout failed: HTTP " + response.status + " | " + JSON.stringify(result.error || result.message || result)
@@ -272,6 +295,8 @@ export default async function handler(req, res) {
       success: true,
       withdrawalId,
       amount,
+      fee,
+      netAmount,
       currency: "USDT",
       status: "processing",
     });
